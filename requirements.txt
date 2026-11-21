@@ -1,0 +1,3 @@
+python-telegram-bot==22.8
+yt-dlp>=2026.10.21
+curl_cffi==0.16.0
