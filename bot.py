@@ -268,53 +268,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
-def run_debug_tests() -> dict:
-    """Temporary diagnostics: test providers from inside this host. Remove after validation."""
-    results = {}
-    reel = "https://www.instagram.com/reel/DfwFdExq99d/"
-    yt = "https://youtu.be/4CHNt9y_1YY"
-    # 1. cobalt Instagram (full download)
-    try:
-        tmp = tempfile.mkdtemp(prefix="dbg_")
-        p = download_cobalt(reel, tmp)
-        results["cobalt_instagram"] = {"ok": bool(p), "bytes": os.path.getsize(p) if p else 0}
-        shutil.rmtree(tmp, ignore_errors=True)
-    except Exception as e:
-        results["cobalt_instagram"] = {"ok": False, "err": str(e)[:200]}
-    # 2. cobalt YouTube (resolve only)
-    try:
-        from curl_cffi import requests as creq
-        r = creq.post(COBALT_HOSTS[0] + "/", json={"url": yt, "downloadMode": "auto"},
-                      headers={"Accept": "application/json", "Content-Type": "application/json"},
-                      impersonate="chrome", timeout=30)
-        results["cobalt_youtube_resolve"] = {"status": r.status_code, "body": r.text[:200]}
-    except Exception as e:
-        results["cobalt_youtube_resolve"] = {"err": str(e)[:200]}
-    # 3. yt-dlp YouTube with POT (extraction only, no download)
-    try:
-        opts = ydl_opts(os.path.join(tempfile.gettempdir(), "dbg_%(id)s.%(ext)s"))
-        opts.pop("outtmpl", None)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(yt, download=False)
-        fmts = info.get("formats") or []
-        mp4s = [f for f in fmts if f.get("vcodec", "none") != "none" and (f.get("height") or 0) > 0]
-        best = max(mp4s, key=lambda f: f["height"]) if mp4s else {}
-        results["ytdlp_youtube_pot"] = {"ok": True, "title": (info.get("title") or "")[:80],
-                                        "duration": info.get("duration"),
-                                        "best_height": best.get("height"), "n_formats": len(fmts)}
-    except Exception as e:
-        results["ytdlp_youtube_pot"] = {"ok": False, "err": str(e)[:300]}
-    # 4. yt-dlp Instagram (extraction only) for comparison
-    try:
-        opts = ydl_opts(os.path.join(tempfile.gettempdir(), "dbg_%(id)s.%(ext)s"))
-        opts.pop("outtmpl", None)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(reel, download=False)
-        results["ytdlp_instagram"] = {"ok": True, "duration": info.get("duration")}
-    except Exception as e:
-        results["ytdlp_instagram"] = {"ok": False, "err": str(e)[:300]}
-    return results
-
 def run_health_server() -> None:
     port = int(os.environ.get("PORT") or os.environ.get("HEALTH_PORT") or "0")
     if not port:
@@ -322,14 +275,6 @@ def run_health_server() -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path.startswith("/debug-providers"):
-                import json as _json
-                body = _json.dumps(run_debug_tests()).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(body)
-                return
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"ok")
