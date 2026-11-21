@@ -54,27 +54,63 @@ MSG_TOO_BIG = (
 TIKTOK_RE = re.compile(r"(tiktok\.com|vt\.tiktok\.com|vm\.tiktok\.com)", re.I)
 
 
+def _save_mp4(resp_content: bytes, tmp: str) -> str | None:
+    out = os.path.join(tmp, "video.mp4")
+    with open(out, "wb") as f:
+        f.write(resp_content)
+    return out if os.path.getsize(out) > 10000 else None
+
+
 def download_tiktok_tikwm(url: str, tmp: str) -> str | None:
     """Watermark-free TikTok download via the tikwm API (works on download-disabled videos)."""
     from curl_cffi import requests as creq
     try:
         api = "https://www.tikwm.com/api/?url=" + urllib.parse.quote(url, safe="") + "&hd=1"
-        d = creq.get(api, impersonate="chrome", timeout=30).json()
+        d = creq.get(api, impersonate="chrome", timeout=45).json()
         if d.get("code") != 0 or not d.get("data"):
             return None
         vurl = d["data"].get("hdplay") or d["data"].get("play")
         if not vurl:
             return None
-        out = os.path.join(tmp, "video.mp4")
         resp = creq.get(vurl, impersonate="chrome", timeout=180)
         if resp.status_code != 200 or not resp.content:
             return None
-        with open(out, "wb") as f:
-            f.write(resp.content)
-        return out if os.path.getsize(out) > 10000 else None
+        return _save_mp4(resp.content, tmp)
     except Exception:
         log.exception("tikwm failed for %s", url)
         return None
+
+
+def download_tiktok_ssstik(url: str, tmp: str) -> str | None:
+    """Watermark-free TikTok download via ssstik.io (works on download-disabled videos)."""
+    from curl_cffi import requests as creq
+    try:
+        s = creq.Session(impersonate="chrome")
+        home = s.get("https://ssstik.io/", timeout=30)
+        m = (re.search(r's_tt\s*=\s*["\']([^"\']+)', home.text)
+             or re.search(r'tt\s*[:=]\s*["\']([^"\']+)', home.text))
+        if not m:
+            return None
+        r = s.post(
+            "https://ssstik.io/abc?url=dl",
+            data={"id": url, "locale": "en", "tt": m.group(1)},
+            headers={"Referer": "https://ssstik.io/", "HX-Request": "true"},
+            timeout=60,
+        )
+        links = re.findall(r'href="(https?://[^"]+)"', r.text)
+        vids = [l for l in links if "/ssstik/m/" not in l]
+        if not vids:
+            return None
+        resp = s.get(vids[0], headers={"Referer": "https://ssstik.io/"}, timeout=180)
+        if resp.status_code != 200 or not resp.content:
+            return None
+        return _save_mp4(resp.content, tmp)
+    except Exception:
+        log.exception("ssstik failed for %s", url)
+        return None
+
+
+TIKTOK_API_PATHS = (download_tiktok_tikwm, download_tiktok_ssstik)
 
 
 def ydl_opts(outtmpl: str) -> dict:
@@ -112,7 +148,11 @@ def download_and_prepare(url: str) -> tuple[str | None, str | None]:
     tmp = tempfile.mkdtemp(prefix="dl_")
     try:
         if TIKTOK_RE.search(url):
-            got = download_tiktok_tikwm(url, tmp)
+            got = None
+            for api_fn in TIKTOK_API_PATHS:
+                got = api_fn(url, tmp)
+                if got:
+                    break
             if got:
                 path = got
                 if os.path.getsize(path) > MAX_BYTES:
@@ -181,6 +221,53 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(MSG_START)
 
 
+def debug_providers() -> str:
+    """TEMPORARY: probe provider reachability from this host."""
+    import json as _json
+    from curl_cffi import requests as creq
+    test_url = "https://vt.tiktok.com/ZSs1wLHww/"
+    q = urllib.parse.quote(test_url, safe="")
+    out = {}
+
+    def probe(name, fn):
+        try:
+            out[name] = fn()
+        except Exception as e:
+            out[name] = f"EXC {type(e).__name__}: {e}"
+
+    def get_probe(u, **kw):
+        def go():
+            r = creq.get(u, impersonate="chrome", timeout=25, **kw)
+            return {"status": r.status_code, "ct": r.headers.get("content-type", ""),
+                    "len": len(r.content), "head": r.text[:200]}
+        return go
+
+    probe("tikwm_www", get_probe(f"https://www.tikwm.com/api/?url={q}&hd=1"))
+    probe("tikwm_bare", get_probe(f"https://tikwm.com/api/?url={q}&hd=1"))
+    probe("ssstik_home", get_probe("https://ssstik.io/"))
+    probe("musicaldown", get_probe("https://musicaldown.com/"))
+    probe("snaptik", get_probe("https://snaptik.app/"))
+    probe("savetik", get_probe("https://savetik.co/"))
+
+    def ssstik_full():
+        s = creq.Session(impersonate="chrome")
+        home = s.get("https://ssstik.io/", timeout=25)
+        m = re.search(r's_tt\s*=\s*["\']([^"\']+)', home.text)
+        if not m:
+            return "no token"
+        r = s.post("https://ssstik.io/abc?url=dl",
+                   data={"id": test_url, "locale": "en", "tt": m.group(1)},
+                   headers={"Referer": "https://ssstik.io/", "HX-Request": "true"}, timeout=60)
+        links = [l for l in re.findall(r'href="(https?://[^"]+)"', r.text) if "/ssstik/m/" not in l]
+        if not links:
+            return {"post_status": r.status_code, "links": 0, "head": r.text[:200]}
+        resp = s.get(links[0], headers={"Referer": "https://ssstik.io/"}, timeout=120)
+        return {"post_status": r.status_code, "dl_status": resp.status_code, "dl_bytes": len(resp.content)}
+    probe("ssstik_full", ssstik_full)
+
+    return _json.dumps(out, indent=1)
+
+
 def run_health_server() -> None:
     port = int(os.environ.get("PORT") or os.environ.get("HEALTH_PORT") or "0")
     if not port:
@@ -188,6 +275,11 @@ def run_health_server() -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/debug-providers"):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(debug_providers().encode())
+                return
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"ok")
