@@ -110,7 +110,7 @@ def download_tiktok_ssstik(url: str, tmp: str) -> str | None:
         return None
 
 
-TIKTOK_API_PATHS = (download_tiktok_tikwm, download_tiktok_ssstik)
+TIKTOK_API_PATHS = (download_tiktok_ssstik, download_tiktok_tikwm)
 
 
 def ydl_opts(outtmpl: str) -> dict:
@@ -221,53 +221,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(MSG_START)
 
 
-def debug_providers() -> str:
-    """TEMPORARY: probe provider reachability from this host."""
-    import json as _json
-    from curl_cffi import requests as creq
-    test_url = "https://vt.tiktok.com/ZSs1wLHww/"
-    q = urllib.parse.quote(test_url, safe="")
-    out = {}
-
-    def probe(name, fn):
-        try:
-            out[name] = fn()
-        except Exception as e:
-            out[name] = f"EXC {type(e).__name__}: {e}"
-
-    def get_probe(u, **kw):
-        def go():
-            r = creq.get(u, impersonate="chrome", timeout=25, **kw)
-            return {"status": r.status_code, "ct": r.headers.get("content-type", ""),
-                    "len": len(r.content), "head": r.text[:200]}
-        return go
-
-    probe("tikwm_www", get_probe(f"https://www.tikwm.com/api/?url={q}&hd=1"))
-    probe("tikwm_bare", get_probe(f"https://tikwm.com/api/?url={q}&hd=1"))
-    probe("ssstik_home", get_probe("https://ssstik.io/"))
-    probe("musicaldown", get_probe("https://musicaldown.com/"))
-    probe("snaptik", get_probe("https://snaptik.app/"))
-    probe("savetik", get_probe("https://savetik.co/"))
-
-    def ssstik_full():
-        s = creq.Session(impersonate="chrome")
-        home = s.get("https://ssstik.io/", timeout=25)
-        m = re.search(r's_tt\s*=\s*["\']([^"\']+)', home.text)
-        if not m:
-            return "no token"
-        r = s.post("https://ssstik.io/abc?url=dl",
-                   data={"id": test_url, "locale": "en", "tt": m.group(1)},
-                   headers={"Referer": "https://ssstik.io/", "HX-Request": "true"}, timeout=60)
-        links = [l for l in re.findall(r'href="(https?://[^"]+)"', r.text) if "/ssstik/m/" not in l]
-        if not links:
-            return {"post_status": r.status_code, "links": 0, "head": r.text[:200]}
-        resp = s.get(links[0], headers={"Referer": "https://ssstik.io/"}, timeout=120)
-        return {"post_status": r.status_code, "dl_status": resp.status_code, "dl_bytes": len(resp.content)}
-    probe("ssstik_full", ssstik_full)
-
-    return _json.dumps(out, indent=1)
-
-
 def run_health_server() -> None:
     port = int(os.environ.get("PORT") or os.environ.get("HEALTH_PORT") or "0")
     if not port:
@@ -275,11 +228,6 @@ def run_health_server() -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path.startswith("/debug-providers"):
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(debug_providers().encode())
-                return
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"ok")
