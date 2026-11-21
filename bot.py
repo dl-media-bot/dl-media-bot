@@ -112,6 +112,37 @@ def download_tiktok_ssstik(url: str, tmp: str) -> str | None:
 
 TIKTOK_API_PATHS = (download_tiktok_ssstik, download_tiktok_tikwm)
 
+COBALT_HOSTS = ("https://rue-cobalt.xenon.zone", "https://cobaltapi.cjs.nz")
+IG_RE = re.compile(r"instagram\.com", re.I)
+YT_RE = re.compile(r"(youtu\.be|youtube\.com)", re.I)
+
+
+def download_cobalt(url: str, tmp: str) -> str | None:
+    """Download via no-auth cobalt API instances (handles Instagram from datacenter IPs)."""
+    from curl_cffi import requests as creq
+    for host in COBALT_HOSTS:
+        try:
+            r = creq.post(
+                host + "/",
+                json={"url": url, "downloadMode": "auto", "videoQuality": "1080"},
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                impersonate="chrome",
+                timeout=30,
+            )
+            if r.status_code != 200:
+                continue
+            vurl = r.json().get("url")
+            if not vurl:
+                continue
+            resp = creq.get(vurl, impersonate="chrome", timeout=180)
+            if resp.status_code == 200 and resp.content and len(resp.content) > 10000:
+                return _save_mp4(resp.content, tmp)
+        except Exception:
+            log.exception("cobalt %s failed for %s", host, url)
+    return None
+
+
+
 
 def ydl_opts(outtmpl: str) -> dict:
     return {
@@ -126,7 +157,8 @@ def ydl_opts(outtmpl: str) -> dict:
         "retries": 3,
         "concurrent_fragment_downloads": 4,
         "impersonate": ImpersonateTarget.from_str("chrome"),
-        "extractor_args": {"youtube": {"player_client": ["android", "web_embedded", "ios", "tv", "web"]}},
+        "extractor_args": {"youtube": {"player_client": ["mweb", "android", "web_embedded", "ios", "tv", "web"],
+                                  "fetch_pot": ["always"]}},
     }
 
 
@@ -153,6 +185,19 @@ def download_and_prepare(url: str) -> tuple[str | None, str | None]:
                 got = api_fn(url, tmp)
                 if got:
                     break
+            if got:
+                path = got
+                if os.path.getsize(path) > MAX_BYTES:
+                    for scale, crf in ((480, 28), (360, 32), (240, 35)):
+                        dst = os.path.join(tmp, f"compressed_{scale}.mp4")
+                        if compress(path, dst, scale, crf) and os.path.getsize(dst) <= MAX_BYTES:
+                            path = dst
+                            break
+                    else:
+                        return None, "too_big"
+                return path, None
+        if IG_RE.search(url):
+            got = download_cobalt(url, tmp)
             if got:
                 path = got
                 if os.path.getsize(path) > MAX_BYTES:
@@ -221,6 +266,55 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(MSG_START)
 
 
+
+
+def run_debug_tests() -> dict:
+    """Temporary diagnostics: test providers from inside this host. Remove after validation."""
+    results = {}
+    reel = "https://www.instagram.com/reel/DfwFdExq99d/"
+    yt = "https://youtu.be/4CHNt9y_1YY"
+    # 1. cobalt Instagram (full download)
+    try:
+        tmp = tempfile.mkdtemp(prefix="dbg_")
+        p = download_cobalt(reel, tmp)
+        results["cobalt_instagram"] = {"ok": bool(p), "bytes": os.path.getsize(p) if p else 0}
+        shutil.rmtree(tmp, ignore_errors=True)
+    except Exception as e:
+        results["cobalt_instagram"] = {"ok": False, "err": str(e)[:200]}
+    # 2. cobalt YouTube (resolve only)
+    try:
+        from curl_cffi import requests as creq
+        r = creq.post(COBALT_HOSTS[0] + "/", json={"url": yt, "downloadMode": "auto"},
+                      headers={"Accept": "application/json", "Content-Type": "application/json"},
+                      impersonate="chrome", timeout=30)
+        results["cobalt_youtube_resolve"] = {"status": r.status_code, "body": r.text[:200]}
+    except Exception as e:
+        results["cobalt_youtube_resolve"] = {"err": str(e)[:200]}
+    # 3. yt-dlp YouTube with POT (extraction only, no download)
+    try:
+        opts = ydl_opts(os.path.join(tempfile.gettempdir(), "dbg_%(id)s.%(ext)s"))
+        opts.pop("outtmpl", None)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(yt, download=False)
+        fmts = info.get("formats") or []
+        mp4s = [f for f in fmts if f.get("vcodec", "none") != "none" and (f.get("height") or 0) > 0]
+        best = max(mp4s, key=lambda f: f["height"]) if mp4s else {}
+        results["ytdlp_youtube_pot"] = {"ok": True, "title": (info.get("title") or "")[:80],
+                                        "duration": info.get("duration"),
+                                        "best_height": best.get("height"), "n_formats": len(fmts)}
+    except Exception as e:
+        results["ytdlp_youtube_pot"] = {"ok": False, "err": str(e)[:300]}
+    # 4. yt-dlp Instagram (extraction only) for comparison
+    try:
+        opts = ydl_opts(os.path.join(tempfile.gettempdir(), "dbg_%(id)s.%(ext)s"))
+        opts.pop("outtmpl", None)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(reel, download=False)
+        results["ytdlp_instagram"] = {"ok": True, "duration": info.get("duration")}
+    except Exception as e:
+        results["ytdlp_instagram"] = {"ok": False, "err": str(e)[:300]}
+    return results
+
 def run_health_server() -> None:
     port = int(os.environ.get("PORT") or os.environ.get("HEALTH_PORT") or "0")
     if not port:
@@ -228,6 +322,14 @@ def run_health_server() -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/debug-providers"):
+                import json as _json
+                body = _json.dumps(run_debug_tests()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"ok")
