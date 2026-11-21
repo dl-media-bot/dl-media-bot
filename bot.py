@@ -20,6 +20,26 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("social-dl-bot")
 
+# rolling download stats for the monitoring endpoint
+import collections, time as _time
+_dl_events = collections.deque(maxlen=500)  # (ts, ok:bool, platform:str)
+
+
+def _record(ok: bool, platform: str) -> None:
+    _dl_events.append((_time.time(), ok, platform))
+
+
+def _stats() -> dict:
+    now = _time.time()
+    def window(sec):
+        ev = [e for e in _dl_events if now - e[0] <= sec]
+        return {"total": len(ev), "failures": sum(1 for e in ev if not e[1]),
+                "fail_platforms": sorted({e[2] for e in ev if not e[1]})}
+    return {"ok": True, "uptime_min": round((now - _START_TS) / 60, 1),
+            "last_30m": window(1800), "last_6h": window(21600)}
+
+_START_TS = _time.time()
+
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 MAX_BYTES = 49 * 1024 * 1024  # stay under Telegram's 50MB bot-send cap
 
@@ -247,12 +267,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     status = await update.message.reply_text(MSG_WORKING)
     await update.message.chat.send_action(ChatAction.UPLOAD_VIDEO)
     path, err = await asyncio.to_thread(download_and_prepare, supported)
+    platform = ("tiktok" if TIKTOK_RE.search(supported) else
+                "instagram" if IG_RE.search(supported) else
+                "youtube" if YT_RE.search(supported) else "other")
     if err == "too_big":
+        _record(False, platform)
         await status.edit_text(MSG_TOO_BIG)
         return
     if err or not path:
+        _record(False, platform)
         await status.edit_text(MSG_FAIL)
         return
+    _record(True, platform)
     try:
         with open(path, "rb") as f:
             await update.message.reply_video(video=f, supports_streaming=True)
@@ -279,6 +305,14 @@ def run_health_server() -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/bot-stats-8bad075aeeda65e5ec15a9ea05fd47a0"):
+                import json as _json
+                body = _json.dumps(_stats()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"ok")
