@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import urllib.parse
 import os
 import re
 import shutil
@@ -50,6 +51,32 @@ MSG_TOO_BIG = (
 )
 
 
+TIKTOK_RE = re.compile(r"(tiktok\.com|vt\.tiktok\.com|vm\.tiktok\.com)", re.I)
+
+
+def download_tiktok_tikwm(url: str, tmp: str) -> str | None:
+    """Watermark-free TikTok download via the tikwm API (works on download-disabled videos)."""
+    from curl_cffi import requests as creq
+    try:
+        api = "https://www.tikwm.com/api/?url=" + urllib.parse.quote(url, safe="") + "&hd=1"
+        d = creq.get(api, impersonate="chrome", timeout=30).json()
+        if d.get("code") != 0 or not d.get("data"):
+            return None
+        vurl = d["data"].get("hdplay") or d["data"].get("play")
+        if not vurl:
+            return None
+        out = os.path.join(tmp, "video.mp4")
+        resp = creq.get(vurl, impersonate="chrome", timeout=180)
+        if resp.status_code != 200 or not resp.content:
+            return None
+        with open(out, "wb") as f:
+            f.write(resp.content)
+        return out if os.path.getsize(out) > 10000 else None
+    except Exception:
+        log.exception("tikwm failed for %s", url)
+        return None
+
+
 def ydl_opts(outtmpl: str) -> dict:
     return {
         "outtmpl": outtmpl,
@@ -84,6 +111,19 @@ def download_and_prepare(url: str) -> tuple[str | None, str | None]:
     """Return (path, None) on success or (None, error_code)."""
     tmp = tempfile.mkdtemp(prefix="dl_")
     try:
+        if TIKTOK_RE.search(url):
+            got = download_tiktok_tikwm(url, tmp)
+            if got:
+                path = got
+                if os.path.getsize(path) > MAX_BYTES:
+                    for scale, crf in ((480, 28), (360, 32), (240, 35)):
+                        dst = os.path.join(tmp, f"compressed_{scale}.mp4")
+                        if compress(path, dst, scale, crf) and os.path.getsize(dst) <= MAX_BYTES:
+                            path = dst
+                            break
+                    else:
+                        return None, "too_big"
+                return path, None
         outtmpl = os.path.join(tmp, "video.%(ext)s")
         with yt_dlp.YoutubeDL(ydl_opts(outtmpl)) as ydl:
             ydl.download([url])
