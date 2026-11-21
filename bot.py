@@ -272,30 +272,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
-def _probe_video(path: str) -> str:
-    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-                        "-show_entries", "stream=codec_name,width,height", "-of", "csv=p=0", path],
-                       capture_output=True, text=True, timeout=30)
-    return r.stdout.strip()
-
-
-def run_speed_probe() -> dict:
-    """Temporary: time full downloads from inside this host. Remove after validation."""
-    import time as _t
-    out = {}
-    for name, u in (("tiktok", "https://vt.tiktok.com/ZSs1wLHww/"),
-                    ("instagram", "https://www.instagram.com/reel/DfwFdExq99d/")):
-        t0 = _t.time()
-        p, err = download_and_prepare(u)
-        dt = round(_t.time() - t0, 1)
-        info = {"sec": dt, "ok": bool(p), "err": err,
-                "bytes": os.path.getsize(p) if p else 0,
-                "video": _probe_video(p) if p else ""}
-        out[name] = info
-        if p:
-            shutil.rmtree(os.path.dirname(p), ignore_errors=True)
-    return out
-
 def run_health_server() -> None:
     port = int(os.environ.get("PORT") or os.environ.get("HEALTH_PORT") or "0")
     if not port:
@@ -303,14 +279,6 @@ def run_health_server() -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path.startswith("/debug-speed"):
-                import json as _json
-                body = _json.dumps(run_speed_probe()).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(body)
-                return
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"ok")
