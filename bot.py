@@ -110,7 +110,7 @@ def download_tiktok_ssstik(url: str, tmp: str) -> str | None:
         return None
 
 
-TIKTOK_API_PATHS = (download_tiktok_ssstik, download_tiktok_tikwm)
+TIKTOK_API_PATHS = (download_tiktok_ssstik,)
 
 COBALT_HOSTS = ("https://rue-cobalt.xenon.zone", "https://cobaltapi.cjs.nz")
 IG_RE = re.compile(r"instagram\.com", re.I)
@@ -135,7 +135,9 @@ def download_cobalt(url: str, tmp: str) -> str | None:
             if not vurl:
                 continue
             resp = creq.get(vurl, impersonate="chrome", timeout=180)
-            if resp.status_code == 200 and resp.content and len(resp.content) > 10000:
+            ct = (resp.headers.get("content-type") or "").lower()
+            if (resp.status_code == 200 and resp.content and len(resp.content) > 10000
+                    and ("video" in ct or "octet-stream" in ct)):
                 return _save_mp4(resp.content, tmp)
         except Exception:
             log.exception("cobalt %s failed for %s", host, url)
@@ -268,6 +270,32 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
+
+
+def _probe_video(path: str) -> str:
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                        "-show_entries", "stream=codec_name,width,height", "-of", "csv=p=0", path],
+                       capture_output=True, text=True, timeout=30)
+    return r.stdout.strip()
+
+
+def run_speed_probe() -> dict:
+    """Temporary: time full downloads from inside this host. Remove after validation."""
+    import time as _t
+    out = {}
+    for name, u in (("tiktok", "https://vt.tiktok.com/ZSs1wLHww/"),
+                    ("instagram", "https://www.instagram.com/reel/DfwFdExq99d/")):
+        t0 = _t.time()
+        p, err = download_and_prepare(u)
+        dt = round(_t.time() - t0, 1)
+        info = {"sec": dt, "ok": bool(p), "err": err,
+                "bytes": os.path.getsize(p) if p else 0,
+                "video": _probe_video(p) if p else ""}
+        out[name] = info
+        if p:
+            shutil.rmtree(os.path.dirname(p), ignore_errors=True)
+    return out
+
 def run_health_server() -> None:
     port = int(os.environ.get("PORT") or os.environ.get("HEALTH_PORT") or "0")
     if not port:
@@ -275,6 +303,14 @@ def run_health_server() -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/debug-speed"):
+                import json as _json
+                body = _json.dumps(run_speed_probe()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"ok")
@@ -288,7 +324,7 @@ def run_health_server() -> None:
 def main() -> None:
     if os.environ.get("PORT") or os.environ.get("HEALTH_PORT"):
         threading.Thread(target=run_health_server, daemon=True).start()
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
