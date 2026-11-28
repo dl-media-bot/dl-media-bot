@@ -217,6 +217,43 @@ def warp_probe(tag: str = "probe") -> None:
             log.warning("WARP %s %s: FAILED after %.1fs: %s", tag, name, _time.time() - t, str(e)[:120])
 
 
+YT_BUDGET = 46 * 1024 * 1024  # video+audio must fit under Telegram's cap without re-encoding
+
+
+def pick_youtube_format(url: str) -> tuple[str | None, bool]:
+    """Via WARP: choose the best (<=1080p) video+audio pair whose estimated size fits the 50MB cap.
+    Returns (format_string|None, known). format None with known=True means nothing fits (too long)."""
+    o = {"quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True, "socket_timeout": 15,
+         "retries": 1, "extractor_retries": 1, "proxy": WARP_PROXY}
+    with yt_dlp.YoutubeDL(o) as ydl:
+        info = ydl.extract_info(url, download=False)
+    dur = info.get("duration") or 0
+
+    def size(f):
+        sz = f.get("filesize") or f.get("filesize_approx")
+        if not sz and f.get("tbr") and dur:
+            sz = f["tbr"] * 125 * dur
+        return sz or 0
+
+    fm = info.get("formats") or []
+    vids = [f for f in fm if f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
+            and (f.get("height") or 0) <= 1080 and size(f)]
+    auds = [f for f in fm if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none") and size(f)]
+    if not vids or not auds:
+        return None, False
+    # smallest decent audio (m4a preferred, >= 48kbps)
+    auds.sort(key=lambda f: (f.get("ext") != "m4a", size(f)))
+    aud = auds[0]
+    # best video that fits: higher resolution first, avc1 (plays everywhere) before others, then bitrate
+    vids.sort(key=lambda f: (-(f.get("height") or 0), not str(f.get("vcodec", "")).startswith("avc1"), -size(f)))
+    for v in vids:
+        if size(v) + size(aud) <= YT_BUDGET:
+            log.info("youtube pick: %sp %s ~%.1fMB (dur %ss)", v.get("height"), v.get("vcodec"),
+                     (size(v) + size(aud)) / 1048576, dur)
+            return f"{v['format_id']}+{aud['format_id']}", True
+    return None, True
+
+
 def ydl_opts_warp(outtmpl: str) -> dict:
     """YouTube via the WARP exit: default clients, no impersonation (as tested)."""
     return {
@@ -263,7 +300,11 @@ def compress(src: str, dst: str, scale: int, crf: int) -> bool:
         "-movflags", "+faststart",
         dst,
     ]
-    r = subprocess.run(cmd, capture_output=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=150)
+    except subprocess.TimeoutExpired:
+        log.warning("ffmpeg compress timed out (scale %s)", scale)
+        return False
     return r.returncode == 0 and os.path.exists(dst)
 
 
@@ -306,7 +347,15 @@ def download_and_prepare(url: str) -> tuple[str | None, str | None]:
         if YT_RE.search(url) and warp_up():
             _t0 = _time.time()
             try:
-                with yt_dlp.YoutubeDL(ydl_opts_warp(outtmpl)) as ydl:
+                fmt, known = pick_youtube_format(url)
+                if known and not fmt:
+                    log.info("youtube video too long for the 50MB cap: %s", url)
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    return None, "too_big"
+                wopts = ydl_opts_warp(outtmpl)
+                if fmt:
+                    wopts["format"] = fmt
+                with yt_dlp.YoutubeDL(wopts) as ydl:
                     ydl.download([url])
                 done = any(f.startswith("video.") for f in os.listdir(tmp))
             except Exception:
@@ -522,7 +571,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     status = await update.message.reply_text(MSG_WORKING)
     await update.message.chat.send_action(ChatAction.UPLOAD_VIDEO)
-    path, err = await asyncio.to_thread(download_and_prepare, supported)
+    try:
+        path, err = await asyncio.wait_for(asyncio.to_thread(download_and_prepare, supported), timeout=420)
+    except asyncio.TimeoutError:
+        log.warning("download timed out after 420s: %s", supported)
+        path, err = None, "fail"
     platform = ("tiktok" if TIKTOK_RE.search(supported) else
                 "instagram" if IG_RE.search(supported) else
                 "youtube" if YT_RE.search(supported) else "other")
