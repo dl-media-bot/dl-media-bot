@@ -187,7 +187,7 @@ def download_cobalt(url: str, tmp: str) -> str | None:
 
 
 def warp_up() -> bool:
-    """True if the local WARP SOCKS proxy accepts connections (cached 15s)."""
+    """True if the local WARP SOCKS port is open (cached 15s)."""
     import socket
     now = _time.time()
     if now - _warp_cache[0] < 15:
@@ -201,6 +201,19 @@ def warp_up() -> bool:
     return ok
 
 
+def warp_probe(tag: str = "probe") -> None:
+    """Log how fast the WARP tunnel really is (Cloudflare trace + YouTube homepage)."""
+    from curl_cffi import requests as creq
+    px = {"https": WARP_PROXY, "http": WARP_PROXY}
+    for name, u in (("trace", "https://www.cloudflare.com/cdn-cgi/trace"), ("youtube", "https://www.youtube.com/generate_204")):
+        t = _time.time()
+        try:
+            r = creq.get(u, proxies=px, timeout=20)
+            log.info("WARP %s %s: HTTP %s in %.1fs", tag, name, r.status_code, _time.time() - t)
+        except Exception as e:
+            log.warning("WARP %s %s: FAILED after %.1fs: %s", tag, name, _time.time() - t, str(e)[:120])
+
+
 def ydl_opts_warp(outtmpl: str) -> dict:
     """YouTube via the WARP exit: default clients, no impersonation (as tested)."""
     return {
@@ -211,8 +224,10 @@ def ydl_opts_warp(outtmpl: str) -> dict:
         "noplaylist": True,
         "quiet": True, "noprogress": True,
         "no_warnings": True,
-        "socket_timeout": 30,
-        "retries": 3,
+        "socket_timeout": 15,
+        "retries": 1,
+        "extractor_retries": 1,
+        "fragment_retries": 3,
         "concurrent_fragment_downloads": 4,
         "proxy": WARP_PROXY,
     }
@@ -286,12 +301,16 @@ def download_and_prepare(url: str) -> tuple[str | None, str | None]:
         outtmpl = os.path.join(tmp, "video.%(ext)s")
         done = False
         if YT_RE.search(url) and warp_up():
+            _t0 = _time.time()
             try:
                 with yt_dlp.YoutubeDL(ydl_opts_warp(outtmpl)) as ydl:
                     ydl.download([url])
                 done = any(f.startswith("video.") for f in os.listdir(tmp))
             except Exception:
                 log.exception("youtube via WARP failed, falling back to direct: %s", url)
+            log.info("youtube via WARP %s in %.1fs", "ok" if done else "FAILED", _time.time() - _t0)
+            if not done:
+                threading.Thread(target=warp_probe, args=("after-fail",), daemon=True).start()
             _warp_stats[0 if done else 1] += 1
             if not done:
                 for f in os.listdir(tmp):
@@ -564,6 +583,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    threading.Thread(target=lambda: (_time.sleep(45), warp_probe("startup")), daemon=True).start()
     log.info("bot starting")
     app.run_polling(drop_pending_updates=True)
 
