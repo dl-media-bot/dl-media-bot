@@ -85,6 +85,10 @@ MSG_MUSIC_KIND = "أنا بدعم لينكات الأغاني الفردية ب�
 MSG_MUSIC_FAIL = (
     "معرفتش ألاقي الأغنية دي وأنزّلها. جرّب لينك أغنية تانية أو ابعتلي اسمها من يوتيوب."
 )
+MSG_LINK = (
+    "الفيديو ده أكبر من ٥٠ ميجا (حد تيليجرام للبوتات) فمقدرتش أبعتهولك هنا. "
+    "رفعته على رابط مؤقت تنزله منه (ممكن يتمسح بعد فترة، فنزله بسرعة):\n{url}"
+)
 MSG_TOO_BIG = (
     "للأسف الفيديو ده أكبر من ٥٠ ميجا حتى بعد ما ضغطته، وتيليجرام مش بيسمح للبوتات "
     "تبعت أكتر من كده. جرّب فيديو أقصر أو جودة أقل من المصدر."
@@ -220,7 +224,7 @@ def warp_probe(tag: str = "probe") -> None:
 YT_BUDGET = 46 * 1024 * 1024  # video+audio must fit under Telegram's cap without re-encoding
 
 
-def pick_youtube_format(url: str) -> tuple[str | None, bool]:
+def pick_youtube_format(url: str, budget: int = None) -> tuple[str | None, bool]:
     """Via WARP: choose the best (<=1080p) video+audio pair whose estimated size fits the 50MB cap.
     Returns (format_string|None, known). format None with known=True means nothing fits (too long)."""
     o = {"quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True, "socket_timeout": 15,
@@ -228,6 +232,7 @@ def pick_youtube_format(url: str) -> tuple[str | None, bool]:
     with yt_dlp.YoutubeDL(o) as ydl:
         info = ydl.extract_info(url, download=False)
     dur = info.get("duration") or 0
+    budget = budget or YT_BUDGET
 
     def size(f):
         sz = f.get("filesize") or f.get("filesize_approx")
@@ -247,7 +252,7 @@ def pick_youtube_format(url: str) -> tuple[str | None, bool]:
     # best video that fits: higher resolution first, avc1 (plays everywhere) before others, then bitrate
     vids.sort(key=lambda f: (-(f.get("height") or 0), not str(f.get("vcodec", "")).startswith("avc1"), -size(f)))
     for v in vids:
-        if size(v) + size(aud) <= YT_BUDGET:
+        if size(v) + size(aud) <= budget:
             log.info("youtube pick: %sp %s ~%.1fMB (dur %ss)", v.get("height"), v.get("vcodec"),
                      (size(v) + size(aud)) / 1048576, dur)
             return f"{v['format_id']}+{aud['format_id']}", True
@@ -308,6 +313,47 @@ def compress(src: str, dst: str, scale: int, crf: int) -> bool:
     return r.returncode == 0 and os.path.exists(dst)
 
 
+GOFILE_URL = "https://upload.gofile.io/uploadfile"
+LINK_MAX_BYTES = 800 * 1024 * 1024  # stay well under Render's disk
+
+
+def upload_gofile(path: str) -> str | None:
+    """Upload to Gofile as an anonymous guest (free, no account). Returns the download page or None."""
+    from curl_cffi import requests as creq, CurlMime
+    try:
+        mp = CurlMime()
+        mp.addpart(name="file", filename=os.path.basename(path), local_path=path, content_type="video/mp4")
+        r = creq.post(GOFILE_URL, multipart=mp, timeout=600)
+        d = r.json()
+        if r.status_code == 200 and d.get("status") == "ok":
+            return d["data"]["downloadPage"]
+        log.warning("gofile upload failed: HTTP %s %s", r.status_code, str(d)[:150])
+    except Exception:
+        log.exception("gofile upload failed")
+    return None
+
+
+def link_fallback(path: str) -> tuple[None, str]:
+    """File is over Telegram's cap: send a temporary download link instead."""
+    if os.path.getsize(path) > LINK_MAX_BYTES:
+        return None, "too_big"
+    url = upload_gofile(path)
+    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+    return (None, "link:" + url) if url else (None, "too_big")
+
+
+def fit_or_link(path: str, tmp: str) -> tuple[str | None, str | None]:
+    """Return (path, None) if it fits Telegram; try the compress ladder for modest overshoot, else a link."""
+    if os.path.getsize(path) <= MAX_BYTES:
+        return path, None
+    if os.path.getsize(path) <= 150 * 1024 * 1024:
+        for scale, crf in ((480, 28), (360, 32), (240, 35)):
+            dst = os.path.join(tmp, f"compressed_{scale}.mp4")
+            if compress(path, dst, scale, crf) and os.path.getsize(dst) <= MAX_BYTES:
+                return dst, None
+    return link_fallback(path)
+
+
 def download_and_prepare(url: str) -> tuple[str | None, str | None]:
     """Return (path, None) on success or (None, error_code)."""
     tmp = tempfile.mkdtemp(prefix="dl_")
@@ -319,29 +365,11 @@ def download_and_prepare(url: str) -> tuple[str | None, str | None]:
                 if got:
                     break
             if got:
-                path = got
-                if os.path.getsize(path) > MAX_BYTES:
-                    for scale, crf in ((480, 28), (360, 32), (240, 35)):
-                        dst = os.path.join(tmp, f"compressed_{scale}.mp4")
-                        if compress(path, dst, scale, crf) and os.path.getsize(dst) <= MAX_BYTES:
-                            path = dst
-                            break
-                    else:
-                        return None, "too_big"
-                return path, None
+                return fit_or_link(got, tmp)
         if IG_RE.search(url):
             got = download_cobalt(url, tmp)
             if got:
-                path = got
-                if os.path.getsize(path) > MAX_BYTES:
-                    for scale, crf in ((480, 28), (360, 32), (240, 35)):
-                        dst = os.path.join(tmp, f"compressed_{scale}.mp4")
-                        if compress(path, dst, scale, crf) and os.path.getsize(dst) <= MAX_BYTES:
-                            path = dst
-                            break
-                    else:
-                        return None, "too_big"
-                return path, None
+                return fit_or_link(got, tmp)
         outtmpl = os.path.join(tmp, "video.%(ext)s")
         done = False
         if YT_RE.search(url) and warp_up():
@@ -349,9 +377,11 @@ def download_and_prepare(url: str) -> tuple[str | None, str | None]:
             try:
                 fmt, known = pick_youtube_format(url)
                 if known and not fmt:
-                    log.info("youtube video too long for the 50MB cap: %s", url)
-                    shutil.rmtree(tmp, ignore_errors=True)
-                    return None, "too_big"
+                    log.info("youtube video over the 50MB cap, trying link fallback: %s", url)
+                    fmt, known = pick_youtube_format(url, 450 * 1024 * 1024)
+                    if known and not fmt:
+                        shutil.rmtree(tmp, ignore_errors=True)
+                        return None, "too_big"
                 wopts = ydl_opts_warp(outtmpl)
                 if fmt:
                     wopts["format"] = fmt
@@ -377,15 +407,7 @@ def download_and_prepare(url: str) -> tuple[str | None, str | None]:
         if not files:
             return None, "fail"
         path = max(files, key=os.path.getsize)
-        if os.path.getsize(path) > MAX_BYTES:
-            for scale, crf in ((480, 28), (360, 32), (240, 35)):
-                dst = os.path.join(tmp, f"compressed_{scale}.mp4")
-                if compress(path, dst, scale, crf) and os.path.getsize(dst) <= MAX_BYTES:
-                    path = dst
-                    break
-            else:
-                return None, "too_big"
-        return path, None
+        return fit_or_link(path, tmp)
     except Exception:
         log.exception("download failed for %s", url)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -572,13 +594,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     status = await update.message.reply_text(MSG_WORKING)
     await update.message.chat.send_action(ChatAction.UPLOAD_VIDEO)
     try:
-        path, err = await asyncio.wait_for(asyncio.to_thread(download_and_prepare, supported), timeout=420)
+        path, err = await asyncio.wait_for(asyncio.to_thread(download_and_prepare, supported), timeout=900)
     except asyncio.TimeoutError:
-        log.warning("download timed out after 420s: %s", supported)
+        log.warning("download timed out after 900s: %s", supported)
         path, err = None, "fail"
     platform = ("tiktok" if TIKTOK_RE.search(supported) else
                 "instagram" if IG_RE.search(supported) else
                 "youtube" if YT_RE.search(supported) else "other")
+    if err and err.startswith("link:"):
+        _record(True, platform)
+        await status.edit_text(MSG_LINK.format(url=err[5:]))
+        return
     if err == "too_big":
         _record(False, platform)
         await status.edit_text(MSG_TOO_BIG)
