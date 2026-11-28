@@ -255,6 +255,18 @@ def download_reddit(url: str, tmp: str) -> str | None:
     return best
 
 
+def wait_warp(timeout: int = 100) -> bool:
+    """Right after a deploy WARP needs up to ~1 min to come up; YouTube never works without it from a
+    datacenter IP, so wait for it instead of falling through to a direct attempt that is sure to fail."""
+    end = _time.time() + timeout
+    while _time.time() < end:
+        _warp_cache[0] = 0  # bypass the 15s cache
+        if warp_up():
+            return True
+        _time.sleep(3)
+    return warp_up()
+
+
 def warp_up() -> bool:
     """True if the local WARP SOCKS port is open (cached 15s)."""
     import socket
@@ -466,7 +478,7 @@ def download_and_prepare(url: str) -> tuple[str | None, str | None]:
                 return fit_or_link(got, tmp)
         outtmpl = os.path.join(tmp, "video.%(ext)s")
         done = False
-        if YT_RE.search(url) and warp_up():
+        if YT_RE.search(url) and (warp_up() or wait_warp()):
             _t0 = _time.time()
             try:
                 fmt, known = pick_youtube_format(url)
@@ -573,7 +585,7 @@ def download_music(url: str) -> tuple[str | None, dict | None, str | None]:
     try:
         q = f"{info['artist']} {info['title']}".strip()
         base = {"quiet": True, "noprogress": True, "noprogress": True, "no_warnings": True, "socket_timeout": 30, "retries": 3, "noplaylist": True}
-        proxies = [WARP_PROXY] if warp_up() else []
+        proxies = [WARP_PROXY] if (warp_up() or wait_warp()) else []
         proxies.append(None)  # direct as last resort
         want = _norm_words(info["title"]) | _norm_words(info["artist"])
         for proxy in proxies:
