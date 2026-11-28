@@ -1,4 +1,5 @@
 import asyncio
+import pathlib
 import html as _html
 import logging
 import urllib.parse
@@ -44,7 +45,9 @@ _START_TS = _time.time()
 _warp_stats = [0, 0]  # youtube downloads via WARP: [success, failed->fell back to direct]
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-MAX_BYTES = 49 * 1024 * 1024  # stay under Telegram's 50MB bot-send cap
+USE_LOCAL_API = os.environ.get("USE_LOCAL_API") == "1"  # set by start.sh only when the local Bot API server is up
+# Cloud Bot API: 50MB upload cap. Local Bot API server: up to 2000MB; we cap lower to protect the free tier's disk/RAM.
+MAX_BYTES = (400 if USE_LOCAL_API else 49) * 1024 * 1024
 
 # Free Cloudflare WARP exit (userspace WireGuard SOCKS proxy started by warp.sh).
 # Used ONLY for YouTube; every other platform keeps its direct path. If the proxy
@@ -298,7 +301,7 @@ def warp_probe(tag: str = "probe") -> None:
             log.warning("WARP %s %s: FAILED after %.1fs: %s", tag, name, _time.time() - t, str(e)[:120])
 
 
-YT_BUDGET = 46 * 1024 * 1024  # video+audio must fit under Telegram's cap without re-encoding
+YT_BUDGET = (390 if USE_LOCAL_API else 46) * 1024 * 1024  # video+audio must fit under Telegram's cap without re-encoding
 
 
 def pick_youtube_format(url: str, budget: int = None) -> tuple[str | None, bool]:
@@ -722,8 +725,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         return
     _record(True, platform)
     try:
-        with open(path, "rb") as f:
-            await update.message.reply_video(video=f, supports_streaming=True)
+        if USE_LOCAL_API:
+            await update.message.reply_video(video=pathlib.Path(path), supports_streaming=True)
+        else:
+            with open(path, "rb") as f:
+                await update.message.reply_video(video=f, supports_streaming=True)
         await status.delete()
     except Exception:
         log.exception("send failed")
@@ -768,7 +774,12 @@ def run_health_server() -> None:
 def main() -> None:
     if os.environ.get("PORT") or os.environ.get("HEALTH_PORT"):
         threading.Thread(target=run_health_server, daemon=True).start()
-    app = Application.builder().token(TOKEN).concurrent_updates(True).build()
+    builder = Application.builder().token(TOKEN).concurrent_updates(True)
+    if USE_LOCAL_API:
+        builder = (builder.base_url("http://127.0.0.1:8081/bot").base_file_url("http://127.0.0.1:8081/file/bot")
+                   .local_mode(True).read_timeout(600).write_timeout(600).connect_timeout(30))
+        log.info("using LOCAL Bot API server (uploads up to 2GB, capped at %dMB)", MAX_BYTES // 1048576)
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
