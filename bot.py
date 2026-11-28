@@ -56,7 +56,7 @@ URL_RE = re.compile(r"https?://[^\s]+", re.I)
 SUPPORTED = re.compile(
     r"(tiktok\.com|vt\.tiktok\.com|vm\.tiktok\.com|instagram\.com|youtu\.be|"
     r"youtube\.com|twitter\.com|x\.com|facebook\.com|fb\.watch|fb\.com|"
-    r"open\.spotify\.com|anghami\.com)",
+    r"open\.spotify\.com|anghami\.com|reddit\.com|redd\.it)",
     re.I,
 )
 SPOTIFY_RE = re.compile(r"open\.spotify\.com", re.I)
@@ -159,6 +159,7 @@ TIKTOK_API_PATHS = (download_tiktok_ssstik,)
 COBALT_HOSTS = ("https://rue-cobalt.xenon.zone", "https://cobaltapi.cjs.nz")
 IG_RE = re.compile(r"instagram\.com", re.I)
 YT_RE = re.compile(r"(youtu\.be|youtube\.com)", re.I)
+RD_RE = re.compile(r"(reddit\.com|redd\.it)", re.I)
 
 
 def download_cobalt(url: str, tmp: str) -> str | None:
@@ -188,6 +189,70 @@ def download_cobalt(url: str, tmp: str) -> str | None:
     return None
 
 
+
+
+def _ff_hls(video_m3u8: str, audio_m3u8: str | None, out: str) -> bool:
+    """Copy (no re-encode) Reddit's HLS video(+audio) into an mp4."""
+    import subprocess
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", video_m3u8]
+    if audio_m3u8:
+        cmd += ["-i", audio_m3u8, "-map", "0:v", "-map", "1:a"]
+    cmd += ["-c", "copy", "-movflags", "+faststart", out]
+    try:
+        subprocess.run(cmd, check=True, timeout=240, capture_output=True)
+        return os.path.exists(out) and os.path.getsize(out) > 10000
+    except Exception:
+        log.warning("reddit ffmpeg hls failed for %s", video_m3u8)
+        return False
+
+
+def download_reddit(url: str, tmp: str) -> str | None:
+    """Reddit blocks datacenter IPs (403 on reddit.com, also through WARP), but v.redd.it's HLS CDN and the
+    vxreddit.com embed service answer. Resolve the post to its v.redd.it id via vxreddit, then copy the HLS streams."""
+    from curl_cffi import requests as creq
+    import urllib.parse as up
+    vid = None
+    m = re.search(r"v\.redd\.it/([a-z0-9]+)", url, re.I)
+    if m:
+        vid = m.group(1)
+    else:
+        try:
+            p = up.urlparse(url)
+            host = "vxreddit.com"
+            r = creq.get(f"https://{host}{p.path}", headers={"User-Agent": "Twitterbot/1.0"}, timeout=25, allow_redirects=True)
+            mm = re.search(r'og:video"\s+content="([^"]+)"', r.text)
+            if mm:
+                q = up.parse_qs(up.urlparse(mm.group(1).replace("&amp;", "&")).query)
+                vm = re.search(r"v\.redd\.it/([a-z0-9]+)", (q.get("video_url") or [""])[0])
+                vid = vm.group(1) if vm else None
+        except Exception:
+            log.exception("vxreddit lookup failed for %s", url)
+    if not vid:
+        return None
+    base = f"https://v.redd.it/{vid}"
+    audio = None
+    for a in ("CMAF_AUDIO_128", "CMAF_AUDIO_64"):
+        try:
+            if creq.get(f"{base}/{a}.m3u8", timeout=15).status_code == 200:
+                audio = f"{base}/{a}.m3u8"
+                break
+        except Exception:
+            pass
+    best = None
+    for q in ("1080", "720", "480", "360", "240"):  # highest first; keep going down only while the file is too big
+        out = os.path.join(tmp, f"video.mp4")
+        if os.path.exists(out):
+            os.remove(out)
+        try:
+            if creq.get(f"{base}/CMAF_{q}.m3u8", timeout=15).status_code != 200:
+                continue
+        except Exception:
+            continue
+        if _ff_hls(f"{base}/CMAF_{q}.m3u8", audio, out):
+            best = out
+            if os.path.getsize(out) <= MAX_BYTES:
+                return out
+    return best
 
 
 def warp_up() -> bool:
@@ -389,6 +454,12 @@ def download_and_prepare(url: str) -> tuple[str | None, str | None]:
                     break
             if got:
                 return fit_or_link(got, tmp)
+        if RD_RE.search(url):
+            got = download_reddit(url, tmp)
+            if got:
+                return fit_or_link(got, tmp)
+            shutil.rmtree(tmp, ignore_errors=True)
+            return None, "fail"
         if IG_RE.search(url):
             got = download_cobalt(url, tmp)
             if got:
@@ -623,7 +694,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         path, err = None, "fail"
     platform = ("tiktok" if TIKTOK_RE.search(supported) else
                 "instagram" if IG_RE.search(supported) else
-                "youtube" if YT_RE.search(supported) else "other")
+                "youtube" if YT_RE.search(supported) else
+                "reddit" if RD_RE.search(supported) else "other")
     if err and err.startswith("link:"):
         _record(True, platform)
         await status.edit_text(MSG_LINK.format(url=err[5:]))
