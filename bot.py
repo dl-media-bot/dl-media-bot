@@ -314,7 +314,28 @@ def compress(src: str, dst: str, scale: int, crf: int) -> bool:
 
 
 GOFILE_URL = "https://upload.gofile.io/uploadfile"
-LINK_MAX_BYTES = 800 * 1024 * 1024  # stay well under Render's disk
+LINK_MAX_BYTES = 1250 * 1024 * 1024  # hard ceiling for the link fallback; the real limit also depends on free disk
+
+
+def _sweep_tmp(max_age: int = 1800) -> None:
+    """Delete leftover dl_/mu_ temp dirs (e.g. from timed-out jobs) so the free disk never fills."""
+    base = tempfile.gettempdir()
+    try:
+        for n in os.listdir(base):
+            p = os.path.join(base, n)
+            if n[:3] in ("dl_", "mu_") and os.path.isdir(p) and _time.time() - os.path.getmtime(p) > max_age:
+                shutil.rmtree(p, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def yt_link_budget() -> int:
+    """Largest YouTube video+audio (bytes) we try: parts plus merged file need ~2.2x on disk."""
+    try:
+        free = shutil.disk_usage(tempfile.gettempdir()).free
+    except OSError:
+        free = 0
+    return int(max(0, min(1200 * 1024 * 1024, (free - 300 * 1024 * 1024) / 2.2)))
 
 
 def upload_gofile(path: str) -> str | None:
@@ -336,6 +357,7 @@ def upload_gofile(path: str) -> str | None:
 def link_fallback(path: str) -> tuple[None, str]:
     """File is over Telegram's cap: send a temporary download link instead."""
     if os.path.getsize(path) > LINK_MAX_BYTES:
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
         return None, "too_big"
     url = upload_gofile(path)
     shutil.rmtree(os.path.dirname(path), ignore_errors=True)
@@ -356,6 +378,7 @@ def fit_or_link(path: str, tmp: str) -> tuple[str | None, str | None]:
 
 def download_and_prepare(url: str) -> tuple[str | None, str | None]:
     """Return (path, None) on success or (None, error_code)."""
+    _sweep_tmp()
     tmp = tempfile.mkdtemp(prefix="dl_")
     try:
         if TIKTOK_RE.search(url):
@@ -378,7 +401,7 @@ def download_and_prepare(url: str) -> tuple[str | None, str | None]:
                 fmt, known = pick_youtube_format(url)
                 if known and not fmt:
                     log.info("youtube video over the 50MB cap, trying link fallback: %s", url)
-                    fmt, known = pick_youtube_format(url, 450 * 1024 * 1024)
+                    fmt, known = pick_youtube_format(url, yt_link_budget() or 1)
                     if known and not fmt:
                         shutil.rmtree(tmp, ignore_errors=True)
                         return None, "too_big"
