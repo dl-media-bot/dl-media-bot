@@ -54,3 +54,10 @@ Render does NOT auto-deploy this service. After every push to `main`:
 - `start.sh` — launches PO-token server + bot.
 - `Dockerfile` — node:22-bookworm + python3 + ffmpeg + bgutil server build.
 - `requirements.txt` — pinned python deps (curl_cffi must stay 0.16.x for yt-dlp impersonation).
+
+## YouTube via Cloudflare WARP (added Nov 28 2026)
+Render's datacenter IPs are blocked by YouTube. `warp.sh` (started best-effort by `start.sh`) registers a free WARP account with wgcf and runs wireproxy as a SOCKS5 proxy on 127.0.0.1:1080. `bot.py` uses it for YouTube only and falls back to the old direct path if it is down or fails. Stats endpoint shows `warp_up`, `yt_warp_ok`, `yt_warp_fail`.
+Rollback: redeploy commit 7cc8cfd.
+
+## Spotify / Anghami (added Nov 28 2026)
+Single-track links only. Title/artist/duration are read from public metadata, then the closest YouTube match (by duration and title) is downloaded as audio. Not the original Spotify/Anghami stream, so quality varies (~128kbps AAC).
