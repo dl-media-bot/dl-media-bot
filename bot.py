@@ -192,6 +192,9 @@ def warp_up() -> bool:
     now = _time.time()
     if now - _warp_cache[0] < 15:
         return _warp_cache[1]
+    if not os.path.exists("/tmp/warp/ok"):  # warp.sh creates it only after the tunnel passes real traffic
+        _warp_cache[0], _warp_cache[1] = now, False
+        return False
     try:
         with socket.create_connection(("127.0.0.1", 1080), timeout=1):
             ok = True
